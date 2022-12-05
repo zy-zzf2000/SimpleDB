@@ -86,6 +86,64 @@ static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
 
+
+//向idx文件的offset(和whence)处写入一条索引记录，该记录的键为key，下一条索引记录的偏移量为ptrval，dat的偏移量为datoff，dat的长度为datlen
+static void _db_writeidx(DB *db, const char *key,
+             off_t offset, int whence, off_t ptrval)
+{
+	struct iovec	iov[2];
+	char			asciiptrlen[PTR_SZ + IDXLEN_SZ + 1];
+	int				len;
+
+	if ((db->ptrval = ptrval) < 0 || ptrval > PTR_MAX)
+		err_quit("_db_writeidx: invalid ptr: %d", ptrval);
+	sprintf(db->idxbuf, "%s%c%lld%c%ld\n", key, SEP,   //%lld是long long int的格式化输出,%ld是long int的格式化输出
+	  (long long)db->datoff, SEP, (long)db->datlen);
+	len = strlen(db->idxbuf);
+	if (len < IDXLEN_MIN || len > IDXLEN_MAX)
+		err_dump("_db_writeidx: invalid length");
+	sprintf(asciiptrlen, "%*lld%*d", PTR_SZ, (long long)ptrval,
+	  IDXLEN_SZ, len);
+
+    //如果是追加，那么lseek和write必须对整个文件加锁，否则会出现多个进程同时写入同一文件的情况
+    //如果不是追加，那么无需加锁
+	if (whence == SEEK_END)		/* we're appending */
+		if (writew_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1,
+		  SEEK_SET, 0) < 0)
+			err_dump("_db_writeidx: writew_lock error");
+
+	//这里用lseek来获取当前文件的偏移量
+	if ((db->idxoff = lseek(db->idxfd, offset, whence)) == -1)
+		err_dump("_db_writeidx: lseek error");
+
+	iov[0].iov_base = asciiptrlen;
+	iov[0].iov_len  = PTR_SZ + IDXLEN_SZ;
+	iov[1].iov_base = db->idxbuf;
+	iov[1].iov_len  = len;
+	if (writev(db->idxfd, &iov[0], 2) != PTR_SZ + IDXLEN_SZ + len)
+		err_dump("_db_writeidx: writev error of index record");
+
+	if (whence == SEEK_END)
+		if (un_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1,
+		  SEEK_SET, 0) < 0)
+			err_dump("_db_writeidx: un_lock error");
+}
+
+//将一个ptrval值写入索引文件的ptrval指针处
+static void _db_writeptr(DB *db, off_t offset, off_t ptrval)
+{
+	char	asciiptr[PTR_SZ + 1];
+
+	if (ptrval < 0 || ptrval > PTR_MAX)
+		err_quit("_db_writeptr: invalid ptr: %d", ptrval);
+	sprintf(asciiptr, "%*lld", PTR_SZ, (long long)ptrval);
+
+	if (lseek(db->idxfd, offset, SEEK_SET) == -1)
+		err_dump("_db_writeptr: lseek error to ptr field");
+	if (write(db->idxfd, asciiptr, PTR_SZ) != PTR_SZ)
+		err_dump("_db_writeptr: write error of ptr field");
+}
+
 //从空闲链表中找到一个key size和data size均满足的空闲空间
 static int  _db_findfree(DB *db, int keylen, int datlen){
     int rc;
@@ -104,7 +162,8 @@ static int  _db_findfree(DB *db, int keylen, int datlen){
 
     //遍历空闲链表
     while(offset!=0){
-        nextoffset = _db_readidx(db,offset); //读取空闲空间的下一个空闲空间的指针
+        nextoffset = _db_readidx(db,offset); //读取offset处的索引记录，同时得到下一个索引记录的地址
+        //注意在_db_readidx中，offset处索引记录记录的包括idxoff,datoff在内的信息会被存储到db中
 
         //如果空闲空间的key size和data size均满足要求，则返回空闲空间的偏移量
         if(strlen(db->idxbuf) == keylen && db->datlen == datlen) break;
@@ -118,7 +177,7 @@ static int  _db_findfree(DB *db, int keylen, int datlen){
     if(offset==0){
         rc = -1;
     }else{
-        //当前找到的空间是
+        //当前找到的空间是offset指向的空间，指向这个空间的指针存储在saveoffset中
         _db_writeptr(db,saveoffset,db->ptrval);
         rc = 0;
     }
@@ -142,13 +201,17 @@ static char* _db_readdat(DB *db){
 }
 
 //读取对应偏移量的索引记录，将其存储在idxbuf中，并且返回索引链表下一条索引记录的偏移量
+//同时还会将数据记录的偏移量存储在datoff中，数据记录的长度存储在datlen中
+//将索引记录的偏移量记录在idxoff中
+//填充的内容包括：idxbuf,datoff,datlen,idxoff
+//offset是这条索引记录在idx文件中的偏移量
 static off_t   _db_readidx(DB *db, off_t offset){
 
     //首先读取下一条索引记录的偏移量以及索引记录的长度(定长部分)
     char asciiptr[PTR_SZ+1];
     char recordlen[IDXLEN_SZ+1];
     struct iovec iov[2];
-    if(lseek(db->idxfd,offset,offset==0?SEEK_CUR:SEEK_SET)==-1){
+    if((db->idxoff = lseek(db->idxfd,offset,offset==0?SEEK_CUR:SEEK_SET))==-1){
         err_dump("_db_readidx:lseek error");
     } 
     iov[0].iov_base = asciiptr;
@@ -207,7 +270,6 @@ static off_t   _db_readidx(DB *db, off_t offset){
 }
 
 //读取索引指针指的内容(注意不是指针指向的内容,这里只是将指针的偏移量读出来)
-//读取指针的内容，将其放入ptrval中，并且返回当前指针的下一个指针地址
 static off_t  _db_readptr(DB *db, off_t offset){
     char asciiptr[PTR_SZ+1];
     //首先将索引文件的文件偏移移动到offset指定位置
@@ -411,6 +473,8 @@ static int _db_find_and_lock(DB *db, const char *key, int writelock){
 
 int db_store(DBHANDLE db, const char *key, const char *data, int flag){
     DB *h = (DB*)db;
+    int rc;
+    off_t ptrval;
     //首先判断flag是否有效
     if(flag!=DB_INSERT && flag!=DB_REPLACE && flag!=DB_STORE){
         errno = EINVAL;
@@ -432,7 +496,18 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
             errno = ENOENT;
             return -1;
         }else{
-
+            //否则是插入，需要将key和data写入索引文件和数据文件
+            ptrval = _db_readptr(h,h->chainoff);
+            //首先尝试是否能够重用空闲链表
+            if(_db_findfree(h,keylen,datlen)<0){
+                //可以重用，此时直接将内容写入findfree中找到的idxoff和datoff
+                _db_writedat(h, data, h->datoff, SEEK_SET);
+                _db_writeidx(h, key, h->idxoff, SEEK_SET, ptrval);
+                _db_writeptr(h, h->chainoff, h->idxoff);
+                h->cnt_stor2++;
+            }else{
+                //不能重用，需要将数据追加到数据文件和索引文件的尾部
+            }
         }
     }else{
         //存在
