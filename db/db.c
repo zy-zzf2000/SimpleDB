@@ -86,6 +86,48 @@ static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
 
+//从空闲链表中找到一个key size和data size均满足的空闲空间
+static int  _db_findfree(DB *db, int keylen, int datlen){
+    int rc;
+    off_t offset, nextoffset, saveoffset;
+
+    //首先对空闲链表加锁
+    if(writew_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0) err_dump("_db_findfree: writew_lock error");
+
+    //saveoffset存储空闲链表中的指针偏移量,可以看作是指针的指针，指针的地址
+    saveoffset = FREE_OFF;
+
+    //offset存储空闲链表中的指针内容，索引记录的地址
+    offset = _db_readptr(db,saveoffset);
+
+    //对于一个指针来说，saveoffset是它的地址，offset是它的内容
+
+    //遍历空闲链表
+    while(offset!=0){
+        nextoffset = _db_readidx(db,offset); //读取空闲空间的下一个空闲空间的指针
+
+        //如果空闲空间的key size和data size均满足要求，则返回空闲空间的偏移量
+        if(strlen(db->idxbuf) == keylen && db->datlen == datlen) break;
+
+        //否则，继续遍历空闲链表
+        saveoffset = offset;
+        offset = nextoffset;
+    }
+
+    //如果offset不为0，则说明找到一个符合条件的空闲块
+    if(offset==0){
+        rc = -1;
+    }else{
+        //当前找到的空间是
+        _db_writeptr(db,saveoffset,db->ptrval);
+        rc = 0;
+    }
+
+    //解锁空闲链表
+    un_lock(db->idxfd,FREE_OFF,SEEK_SET,1);
+    return (rc);
+
+}
 
 //从数据文件中,datoff偏移量处，读取datlen长度的数据到datbuf缓冲区
 static char* _db_readdat(DB *db){
@@ -121,6 +163,7 @@ static off_t   _db_readidx(DB *db, off_t offset){
     asciiptr[PTR_SZ] = 0;
     recordlen[IDXLEN_SZ] = 0;
     
+    //将下一条索引记录的偏移量存入ptrval
     db->ptrval = atol(asciiptr);
     
     db->idxlen = atol(recordlen);
@@ -164,6 +207,7 @@ static off_t   _db_readidx(DB *db, off_t offset){
 }
 
 //读取索引指针指的内容(注意不是指针指向的内容,这里只是将指针的偏移量读出来)
+//读取指针的内容，将其放入ptrval中，并且返回当前指针的下一个指针地址
 static off_t  _db_readptr(DB *db, off_t offset){
     char asciiptr[PTR_SZ+1];
     //首先将索引文件的文件偏移移动到offset指定位置
@@ -325,9 +369,12 @@ char* db_fetch(DBHANDLE h, const char *key){
         ptr = NULL;
         db->cnt_fetcherr += 1;  
     }else{
-        
+        ptr = _db_readdat(db);
+        db->cnt_fetchok += 1;
     }
-    
+    //解锁
+    if(un_lock(db->idxfd,db->chainoff,SEEK_SET,1)<0) err_dump("db_fetch un_lock error");
+    return ptr;
 }
 
 static int _db_find_and_lock(DB *db, const char *key, int writelock){
@@ -359,6 +406,35 @@ static int _db_find_and_lock(DB *db, const char *key, int writelock){
         db->ptroff = offset;
         offset = nextoffset;
     }
-
     return offset==0?-1:0;
+}
+
+int db_store(DBHANDLE db, const char *key, const char *data, int flag){
+    DB *h = (DB*)db;
+    //首先判断flag是否有效
+    if(flag!=DB_INSERT && flag!=DB_REPLACE && flag!=DB_STORE){
+        errno = EINVAL;
+        return -1;
+    }
+
+    int keylen = strlen(key);
+    int datlen = strlen(data)+1;    //+1是为了存储换行符
+    if(datlen<DATLEN_MIN || datlen>DATLEN_MAX){
+        err_dump("db_store:invalid data length");
+    }
+
+    //检查key是否已经存在
+    if(_db_find_and_lock(db,key,1)==-1){
+        //不存在
+        if(flag==DB_REPLACE){
+            //如果是替换，则返回错误
+            if(un_lock(h->idxfd,h->chainoff,SEEK_SET,1)<0) err_dump("db_store un_lock error");
+            errno = ENOENT;
+            return -1;
+        }else{
+
+        }
+    }else{
+        //存在
+    }
 }
