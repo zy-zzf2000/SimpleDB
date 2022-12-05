@@ -124,7 +124,7 @@ static void _db_free(DB *db){
 }
 
 //打开一个数据库，其参数与系统调用open相同
-static DBHANDLE db_open(const char* pathname,int flags,...){
+DBHANDLE db_open(const char* pathname,int flags,...){
     DB			*db;
 	int			len, mode;
 	size_t		i;
@@ -191,7 +191,7 @@ static DBHANDLE db_open(const char* pathname,int flags,...){
             for(i=0;i<NHASH_DEF+1;i++){
                 strcat(hash,asciiptr);
             }
-            stract(hash,"\n");  //添加换行符
+            strcat(hash,"\n");  //添加换行符
 
             //将hash写入索引fd
             if(write(db->idxfd,hash,strlen(hash))!=strlen(hash)) err_dump("db_open write error");
@@ -201,4 +201,18 @@ static DBHANDLE db_open(const char* pathname,int flags,...){
     }
     db_rewind(db);  //将索引文件指针指向第一个记录
     return(db);
+}
+
+//从指定的数据库中读取一条记录
+char* db_fetch(DBHANDLE h, const char *key){
+    DB* db;
+    char* ptr;
+
+    //调用_db_find_and_lock函数，对指定的key查找并且加锁
+    //int res = _db_find_and_lock(d)
+    
+}
+
+static off_t _db_readidx(DB *db, off_t offset){
+    
 }
