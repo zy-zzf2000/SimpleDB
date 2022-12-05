@@ -53,10 +53,12 @@ typedef struct{
     size_t datlen;  //存储查询到的数据记录的长度
 
     off_t  ptrval; /* 索引文件中的指针内容 */
-    off_t  ptroff; /* chain ptr offset pointing to this idx record */
+    off_t  ptroff;   //存储指向该索引的指针的偏移量
     off_t  chainoff; //存储当前查询key所在链表的头指针的偏移量
     off_t  hashoff;  //存储当前查询key对应的索引记录的偏移量
-    DBHASH nhash;    /* current hash table size */
+    DBHASH nhash;    //哈希表大小
+
+    //cnt开头的COUNT类型变量用于记录各种操作的成功和失败次数(因此是可选的)
     COUNT  cnt_delok;    /* delete OK */
     COUNT  cnt_delerr;   /* delete error */
     COUNT  cnt_fetchok;  /* fetch OK */
@@ -83,6 +85,19 @@ static off_t   _db_readptr(DB *, off_t);
 static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
+
+
+//从数据文件中,datoff偏移量处，读取datlen长度的数据到datbuf缓冲区
+static char* _db_readdat(DB *db){
+    lseek(db->datafd,db->datoff,SEEK_SET);
+    read(db->datafd,db->databuf,db->datlen);
+    if(db->databuf[db->datlen-1] != NEWLINE){
+        err_dump("_db_readdat: missing newline");
+    }else{
+        db->databuf[db->datlen-1] = 0;
+    }
+    return db->databuf;
+}
 
 //读取对应偏移量的索引记录，将其存储在idxbuf中，并且返回索引链表下一条索引记录的偏移量
 static off_t   _db_readidx(DB *db, off_t offset){
@@ -304,7 +319,14 @@ char* db_fetch(DBHANDLE h, const char *key){
     char* ptr;
 
     //调用_db_find_and_lock函数，对指定的key查找并且加锁
-    //int res = _db_find_and_lock(d)
+    int res = _db_find_and_lock(h,key,0);
+    if(res<0){
+        //没有找到指定记录
+        ptr = NULL;
+        db->cnt_fetcherr += 1;  
+    }else{
+        
+    }
     
 }
 
@@ -332,12 +354,11 @@ static int _db_find_and_lock(DB *db, const char *key, int writelock){
     offset = _db_readptr(db,db->ptroff);
     while(offset!=0){
         //读取offset指向的索引记录
-
+        nextoffset = _db_readidx(db,offset);
+        if(strcmp(db->idxbuf,key)==0) break; //找到了
+        db->ptroff = offset;
+        offset = nextoffset;
     }
 
-
-}
-
-static off_t _db_readidx(DB *db, off_t offset){
-    
+    return offset==0?-1:0;
 }
