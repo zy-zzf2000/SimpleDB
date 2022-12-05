@@ -27,7 +27,7 @@
 #define FREE_OFF      0	/* free list offset in index file */
 #define HASH_OFF PTR_SZ	/* hash table offset in index file */
 
-typedef unsigned long	DBHASH;	/* hash values */
+typedef unsigned long	DBHASH;	//根据key计算出的hash值
 typedef unsigned long	COUNT;	/* unsigned counter */
 
 //DB结构体
@@ -41,21 +41,21 @@ typedef struct{
     int idxfd;  //索引fd
     int datafd;  //文件fd
 
-    char* idxbuf;  //索引缓冲区
-    char* databuf; //数据缓冲区
+    char* idxbuf;  //索引缓冲区,用于暂时的存储读取到的索引记录
+    char* databuf; //数据缓冲区，用于暂时的存储读取到的数据
 
     char* name;  //文件名
 
-    off_t idxoff;  //索引的偏移量，等于一个指针的字节数（空闲链表指针）
+    off_t idxoff;  //第一条索引记录的偏移量，等于一个指针的字节数（空闲链表指针）
     size_t idxlen;  //索引记录的长度
 
     off_t  datoff;  //存储查询到的数据记录的偏移量
     size_t datlen;  //存储查询到的数据记录的长度
 
-    off_t  ptrval; /* contents of chain ptr in index record */
+    off_t  ptrval; /* 索引文件中的指针内容 */
     off_t  ptroff; /* chain ptr offset pointing to this idx record */
-    off_t  chainoff; /* offset of hash chain for this index record */
-    off_t  hashoff;  /* offset in index file of hash table */
+    off_t  chainoff; //存储当前查询key所在链表的头指针的偏移量
+    off_t  hashoff;  //存储当前查询key对应的索引记录的偏移量
     DBHASH nhash;    /* current hash table size */
     COUNT  cnt_delok;    /* delete OK */
     COUNT  cnt_delerr;   /* delete error */
@@ -83,6 +83,95 @@ static off_t   _db_readptr(DB *, off_t);
 static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
+
+//读取对应偏移量的索引记录，将其存储在idxbuf中，并且返回索引链表下一条索引记录的偏移量
+static off_t   _db_readidx(DB *db, off_t offset){
+
+    //首先读取下一条索引记录的偏移量以及索引记录的长度(定长部分)
+    char asciiptr[PTR_SZ+1];
+    char recordlen[IDXLEN_SZ+1];
+    struct iovec iov[2];
+    if(lseek(db->idxfd,offset,offset==0?SEEK_CUR:SEEK_SET)==-1){
+        err_dump("_db_readidx:lseek error");
+    } 
+    iov[0].iov_base = asciiptr;
+    iov[0].iov_len = PTR_SZ;
+    iov[1].iov_base = recordlen;
+    iov[1].iov_len = IDXLEN_SZ;
+
+    if(readv(db->idxfd,iov,2)!=PTR_SZ+IDXLEN_SZ){
+        err_dump("_db_readidx:readv error");
+    }
+
+    asciiptr[PTR_SZ] = 0;
+    recordlen[IDXLEN_SZ] = 0;
+    
+    db->ptrval = atol(asciiptr);
+    
+    db->idxlen = atol(recordlen);
+
+    //根据idxlen，我们可以将索引记录的真正内容读取出来
+    if(read(db->idxfd,db->idxbuf,db->idxlen)!=db->idxlen){
+        err_dump("_db_readidx:read error");
+    }
+
+    if(db->idxbuf[db->idxlen-1]!=NEWLINE){
+        err_dump("_db_readidx:missing newline");
+    }else{
+        db->idxbuf[db->idxlen-1] = 0;
+    }
+
+    //读取键、数据记录的偏移量以及数据记录的长度
+    char *ptr1,*ptr2;
+    if((ptr1 = strchr(db->idxbuf,SEP))==NULL){
+        err_dump("_db_readidx:missing first separator");
+    }
+    *ptr1++ = 0;  //将第一个分隔符替换成0，方便直接读取
+
+    if(ptr2 = strchr(ptr1,SEP)==NULL){
+        err_dump("_db_readidx:missing second separator");
+    }
+
+    *ptr2++ = 0;
+
+    //将两个分割符都替换成\0,方便直接读取，现在idxbuf中的内容是： key内容\0 + 数据记录偏移量\0 + 数据长度\0
+    //想要得到key，直接对idxbuf进行read即可
+    //想要得到数据记录的偏移量，对ptr1进行read即可
+    //想要得到数据长度，对ptr2进行read即可
+
+    db->datoff = atol(ptr1);
+    db->datlen = atol(ptr2);
+
+    return(db->ptrval);
+
+
+
+}
+
+//读取索引指针指的内容(注意不是指针指向的内容,这里只是将指针的偏移量读出来)
+static off_t  _db_readptr(DB *db, off_t offset){
+    char asciiptr[PTR_SZ+1];
+    //首先将索引文件的文件偏移移动到offset指定位置
+    if(lseek(db->idxfd,offset,SEEK_SET)==-1){
+        err_dump("_db_readptr_:lseek error to ptr field");
+    }
+    if(read(db->idxfd,asciiptr,PTR_SZ)==-1){
+        err_dump("_db_readptr_:read error");
+    }
+    asciiptr[PTR_SZ] = 0; //补上最后的\0
+    return atol(asciiptr);
+}
+
+//根据键值计算hash值
+static DBHASH  _db_hash(DB *db, const char *key){
+    DBHASH hval = 0;
+    char ch;
+    int i;
+    for(i=1;(ch = *key++)!=0;i++){
+        hval += ch*i;
+    }
+    return hval % db->nhash;
+}
 
 //分配一个数据库所需的内存空间
 static DB* _db_alloc(int namelen){
@@ -123,6 +212,10 @@ static void _db_free(DB *db){
 	free(db);
 }
 
+void db_close(DBHANDLE h){
+    _db_free(h);
+}
+
 //打开一个数据库，其参数与系统调用open相同
 DBHANDLE db_open(const char* pathname,int flags,...){
     DB			*db;
@@ -135,7 +228,7 @@ DBHANDLE db_open(const char* pathname,int flags,...){
 
     len = strlen(pathname);
 
-    //分配DB所需空间
+    //分配DB所需空间(这里不包括索引和数据文件)
     db = _db_alloc(strlen(pathname));
     if(db==NULL) err_dump("db_open malloc error");
 
@@ -149,7 +242,7 @@ DBHANDLE db_open(const char* pathname,int flags,...){
 
     //创建数据库
     if(flags & O_CREAT){
-        //创建数据库，我们需要取得第三个权限参数
+        //创建数据库，我们需要取得第三个权限参数（varargs）
         va_list ap;
         va_start(ap,flags);
         mode = va_arg(ap,mode_t);
@@ -185,12 +278,14 @@ DBHANDLE db_open(const char* pathname,int flags,...){
 
         if(statbuff->st_size==0){
             //首先创建一个0的ASCII编码，在本项目中，所有指针都用ASCII偏移量来表示，而0代表了空指针
+            //%*d表示输出的宽度为PTR_SZ，不足的用空格填充
             sprintf(asciiptr,"%*d",PTR_SZ,0);
             //初始化空闲链表指针和哈希表指针，在一个idx数据中，共有哈希表指针NHASH_DEF个，空闲链表指针1个，一共NHASH_DEF+1个指针，每个指针占PTR_SZ个字节
             hash[0] = 0; //先添加一个终止符，用于后面的strcat
             for(i=0;i<NHASH_DEF+1;i++){
                 strcat(hash,asciiptr);
             }
+            //指针区域和索引记录区域用一个换行符分隔
             strcat(hash,"\n");  //添加换行符
 
             //将hash写入索引fd
@@ -211,6 +306,36 @@ char* db_fetch(DBHANDLE h, const char *key){
     //调用_db_find_and_lock函数，对指定的key查找并且加锁
     //int res = _db_find_and_lock(d)
     
+}
+
+static int _db_find_and_lock(DB *db, const char *key, int writelock){
+    //首先找到这个key对应的hash table的位置
+    off_t offset, nextoffset;
+
+    //计算hash值
+    db->chainoff = (_db_hash(db,key)*PTR_SZ)+db->hashoff;
+    db->hashoff = db->chainoff;
+
+    //对所在的链表加锁,这里采用细粒度的锁，即对某个hash链表的第一个字节加上记录锁，而不是整个文件加锁
+    //同时，这里采用的是阻塞式的锁，如果不能获取到锁，则进程会一直阻塞
+    if(writelock){
+        if(writew_lock(db->idxfd,db->chainoff,SEEK_SET,1)<0){
+            err_dump("_db_find_and_lock:write_lock_error");
+        }
+    }else{
+        if(readw_lock(db->idxfd,db->chainoff,SEEK_SET,1)<0){
+            err_dump("_db_find_and_lock:readw_lock_error");
+        }
+    }
+
+    //开始遍历该哈希桶的链表，直到遍历到尾部，或者找到key为止
+    offset = _db_readptr(db,db->ptroff);
+    while(offset!=0){
+        //读取offset指向的索引记录
+
+    }
+
+
 }
 
 static off_t _db_readidx(DB *db, off_t offset){
