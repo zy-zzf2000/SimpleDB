@@ -86,6 +86,11 @@ static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
 
+
+//删除当前db所指向的记录；
+//将其数据和索引文件的键清空为空白
+//更新其所在的哈希桶
+//将该节点的空间加入到空闲链表中去
 static void _db_dodelete(DB *db){
     int		i;
 	char	*ptr;
@@ -552,7 +557,7 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
 
     //检查key是否已经存在
     //这里会保存key对应的哈希桶的偏移量
-    if(_db_find_and_lock(db,key,1)==-1){
+    if(_db_find_and_lock(h,key,1)==-1){
         //不存在
         if(flag==DB_REPLACE){
             //如果是替换，则返回错误
@@ -592,6 +597,18 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
             return -1;
         }else{
             //否则是替换，需要将数据写入数据文件
-
+            if(datlen==h->datlen){
+                //如果长度一致，那么直接覆盖
+                _db_writedat(h,data,h->datoff,SEEK_SET);
+                h->cnt_stor3++;
+            }else{
+                //如果长度不一致，那么需要将数据追加到数据文件的尾部
+                _db_dodelete(h);	
+                ptrval = _db_readptr(h, h->chainoff);
+                _db_writedat(h, data, 0, SEEK_END);
+                _db_writeidx(h, key, 0, SEEK_END, ptrval);
+                _db_writeptr(h, h->chainoff, h->idxoff);
+                h->cnt_stor4++;
+            }
         }
 }
