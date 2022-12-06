@@ -87,6 +87,33 @@ static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
 
 
+static void _db_writedat(DB *db, const char *data, off_t offset, int whence)
+{
+	struct iovec	iov[2];
+	static char		newline = NEWLINE;
+
+	//与写入索引文件一样，如果是追加写入，则需要保证lseek和write是原子操作（否则如果有两个进程同时追加，会导致数据错乱）
+    //如果是覆盖写入，则不需要保证原子性
+	if (whence == SEEK_END) /* we're appending, lock entire file */
+		if (writew_lock(db->datafd, 0, SEEK_SET, 0) < 0)
+			err_dump("_db_writedat: writew_lock error");
+
+	if ((db->datoff = lseek(db->datafd, offset, whence)) == -1)
+		err_dump("_db_writedat: lseek error");
+	db->datlen = strlen(data) + 1;	/* datlen includes newline */
+
+	iov[0].iov_base = (char *) data;
+	iov[0].iov_len  = db->datlen - 1;
+	iov[1].iov_base = &newline;
+	iov[1].iov_len  = 1;
+	if (writev(db->datfd, &iov[0], 2) != db->datlen)
+		err_dump("_db_writedat: writev error of data record");
+
+	if (whence == SEEK_END)
+		if (un_lock(db->datfd, 0, SEEK_SET, 0) < 0)
+			err_dump("_db_writedat: un_lock error");
+}
+
 //向idx文件的offset(和whence)处写入一条索引记录，该记录的键为key，下一条索引记录的偏移量为ptrval，dat的偏移量为datoff，dat的长度为datlen
 static void _db_writeidx(DB *db, const char *key,
              off_t offset, int whence, off_t ptrval)
@@ -264,9 +291,6 @@ static off_t   _db_readidx(DB *db, off_t offset){
     db->datlen = atol(ptr2);
 
     return(db->ptrval);
-
-
-
 }
 
 //读取索引指针指的内容(注意不是指针指向的内容,这里只是将指针的偏移量读出来)
