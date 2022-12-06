@@ -86,6 +86,45 @@ static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
 
+static void _db_dodelete(DB *db){
+    int		i;
+	char	*ptr;
+	off_t	freeptr, saveptr;
+
+    //写一个长度与待删除记录的数据一致的空白数据
+    for (ptr = db->databuf, i = 0; i < db->datlen - 1; i++) *ptr++ = SPACE;
+    *ptr = 0;
+
+    //写一个长度与待删除记录的索引
+    ptr = db->idxbuf;
+	while (*ptr) *ptr++ = SPACE;
+
+    //开始进行删除操作
+    //对freelist加锁
+    writew_lock(db->idxfd, FREE_OFF, SEEK_SET, 1);
+    //清空数据
+    _db_writedat(db, db->databuf, db->datoff, SEEK_SET);
+
+
+    //读取freelist的头指针
+    freeptr = _db_readptr(db, FREE_OFF);
+
+    //ptrval记录了当前索引记录的指针内容，也就是当前索引记录下一条索引记录的偏移量
+    saveptr = db->ptrval;
+
+    //清空索引记录，并且让索引记录的指针指向freelist的头指针
+    _db_writeidx(db,db->idxbuf,db->idxoff,SEEK_SET,freeptr);
+
+    //更新freelist的头指针为当前删除的节点
+    _db_writeptr(db,FREE_OFF,db->idxoff);
+
+    //更新删除节点所在哈希链表，将ptroff指向的指针指向ptrval
+    _db_writeptr(db,db->ptroff,saveptr);
+
+    //解锁freelist
+    un_lock(db->idxfd,FREE_OFF,SEEK_SET,1);
+
+}
 
 static void _db_writedat(DB *db, const char *data, off_t offset, int whence)
 {
@@ -93,10 +132,10 @@ static void _db_writedat(DB *db, const char *data, off_t offset, int whence)
 	static char		newline = NEWLINE;
 
 	//与写入索引文件一样，如果是追加写入，则需要保证lseek和write是原子操作（否则如果有两个进程同时追加，会导致数据错乱）
-    //如果是覆盖写入，则不需要保证原子性
+    //如果是覆盖写入，则不需要保证原子性,因为findfree函数保证了每个空闲块最多只有一个进程使用，因此不会出现多个进程同时覆盖写入同一个位置的情况
 	if (whence == SEEK_END) /* we're appending, lock entire file */
 		if (writew_lock(db->datafd, 0, SEEK_SET, 0) < 0)
-			err_dump("_db_writedat: writew_lock error");
+			err_dump("_db_writedat: writew_lock error"); 
 
 	if ((db->datoff = lseek(db->datafd, offset, whence)) == -1)
 		err_dump("_db_writedat: lseek error");
@@ -106,11 +145,11 @@ static void _db_writedat(DB *db, const char *data, off_t offset, int whence)
 	iov[0].iov_len  = db->datlen - 1;
 	iov[1].iov_base = &newline;
 	iov[1].iov_len  = 1;
-	if (writev(db->datfd, &iov[0], 2) != db->datlen)
+	if (writev(db->datafd, &iov[0], 2) != db->datlen)
 		err_dump("_db_writedat: writev error of data record");
 
 	if (whence == SEEK_END)
-		if (un_lock(db->datfd, 0, SEEK_SET, 0) < 0)
+		if (un_lock(db->datafd, 0, SEEK_SET, 0) < 0)
 			err_dump("_db_writedat: un_lock error");
 }
 
@@ -512,6 +551,7 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
     }
 
     //检查key是否已经存在
+    //这里会保存key对应的哈希桶的偏移量
     if(_db_find_and_lock(db,key,1)==-1){
         //不存在
         if(flag==DB_REPLACE){
@@ -521,19 +561,37 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
             return -1;
         }else{
             //否则是插入，需要将key和data写入索引文件和数据文件
+            //ptrval中存储了需要插入的数据所在哈希桶第一条记录的偏移量，它会被作为插入数据的next指针
+            //可以看出，插入使用的是头插法
             ptrval = _db_readptr(h,h->chainoff);
             //首先尝试是否能够重用空闲链表
-            if(_db_findfree(h,keylen,datlen)<0){
+            if(_db_findfree(h,keylen,datlen)<0){      
+                //不能重用，需要将数据追加到数据文件和索引文件的尾部
+
+                //注意三个write的顺序不能颠倒，在writedat中会首先向dat文件追加数据，然后将数据的长度和偏移量保存在datlen和datoffset中
+                //之后再writeidx中会将索引记录的偏移量保存在idxoff中
+                _db_writedat(h,data,h->datoff,SEEK_END);
+                _db_writeidx(h,key,h->idxoff,SEEK_END,ptrval); //头插法，将新的索引记录插入到链表的头部，原本的第一条记录的偏移量作为新记录的next指针
+                _db_writeptr(h,h->chainoff,h->idxoff);       //头插法,将哈希桶的头指针指向新插入的索引记录
+
+                h->cnt_stor1++;
+            }else{
                 //可以重用，此时直接将内容写入findfree中找到的idxoff和datoff
                 _db_writedat(h, data, h->datoff, SEEK_SET);
                 _db_writeidx(h, key, h->idxoff, SEEK_SET, ptrval);
                 _db_writeptr(h, h->chainoff, h->idxoff);
                 h->cnt_stor2++;
-            }else{
-                //不能重用，需要将数据追加到数据文件和索引文件的尾部
             }
         }
     }else{
         //存在
-    }
+        if(flag==DB_INSERT){
+            //如果是插入，则返回错误
+            if(un_lock(h->idxfd,h->chainoff,SEEK_SET,1)<0) err_dump("db_store un_lock error");
+            errno = EEXIST;
+            return -1;
+        }else{
+            //否则是替换，需要将数据写入数据文件
+
+        }
 }
