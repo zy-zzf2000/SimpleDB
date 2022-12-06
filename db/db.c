@@ -517,7 +517,7 @@ DBHANDLE db_open(const char* pathname,int flags,...){
 
 //从指定的数据库中读取一条记录
 char* db_fetch(DBHANDLE h, const char *key){
-    DB* db;
+    DB *db = (DB*) h;
     char* ptr;
 
     //调用_db_find_and_lock函数，对指定的key查找并且加锁
