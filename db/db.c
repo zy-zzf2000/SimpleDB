@@ -52,10 +52,11 @@ typedef struct{
     off_t  datoff;  //存储查询到的数据记录的偏移量
     size_t datlen;  //存储查询到的数据记录的长度
 
-    off_t  ptrval; /* 索引文件中的指针内容 */
+    off_t  ptrval;   //索引文件中的指针内容 
     off_t  ptroff;   //存储指向该索引的指针的偏移量
     off_t  chainoff; //存储当前查询key所在链表的头指针的偏移量
-    off_t  hashoff;  //存储当前查询key对应的索引记录的偏移量
+    off_t  hashoff;  //存储第一个哈希桶的偏移量
+
     DBHASH nhash;    //哈希表大小
 
     //cnt开头的COUNT类型变量用于记录各种操作的成功和失败次数(因此是可选的)
@@ -86,6 +87,22 @@ static void    _db_writedat(DB *, const char *, off_t, int);
 static void    _db_writeidx(DB *, const char *, off_t, int, off_t);
 static void    _db_writeptr(DB *, off_t, off_t);
 
+
+//将idx的文件偏移量移动到索引记录的起始位置(即空闲链表+哈希表字节偏移之后)
+void db_rewind(DBHANDLE h){
+    DB		*db = h;
+	off_t	offset;
+
+	offset = (db->nhash + 1) * PTR_SZ;	/* +1 for free list ptr */
+
+	/*
+	 * We're just setting the file offset for this process
+	 * to the start of the index records; no need to lock.
+	 * +1 below for newline at end of hash table.
+	 */
+	if ((db->idxoff = lseek(db->idxfd, offset+1, SEEK_SET)) == -1)
+		err_dump("db_rewind: lseek error");
+}
 
 //删除当前db所指向的记录；
 //将其数据和索引文件的键清空为空白
@@ -320,7 +337,7 @@ static off_t   _db_readidx(DB *db, off_t offset){
     }
     *ptr1++ = 0;  //将第一个分隔符替换成0，方便直接读取
 
-    if(ptr2 = strchr(ptr1,SEP)==NULL){
+    if((ptr2 = strchr(ptr1,SEP))==NULL){
         err_dump("_db_readidx:missing second separator");
     }
 
@@ -483,6 +500,17 @@ DBHANDLE db_open(const char* pathname,int flags,...){
         //完成对指针的初始化后，需要关闭锁
         if(un_lock(db->idxfd,0,SEEK_SET,0)<0) err_dump("db_open un_lock error");   //解锁同样是调用fcntl函数实现，cmd为F_SETLK，l_type为F_UNLCK
     }
+
+    db->cnt_delerr = 0;
+    db->cnt_fetcherr = 0;
+    db->cnt_nextrec = 0;
+    db->cnt_stor1 = 0;
+    db->cnt_stor2 = 0;
+    db->cnt_stor3 = 0;
+    db->cnt_stor4 = 0;
+    db->cnt_storerr = 0;
+
+
     db_rewind(db);  //将索引文件指针指向第一个记录
     return(db);
 }
@@ -513,7 +541,7 @@ static int _db_find_and_lock(DB *db, const char *key, int writelock){
 
     //计算hash值
     db->chainoff = (_db_hash(db,key)*PTR_SZ)+db->hashoff;
-    db->hashoff = db->chainoff;
+    db->ptroff = db->chainoff;
 
     //对所在的链表加锁,这里采用细粒度的锁，即对某个hash链表的第一个字节加上记录锁，而不是整个文件加锁
     //同时，这里采用的是阻塞式的锁，如果不能获取到锁，则进程会一直阻塞
@@ -578,14 +606,15 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
                 _db_writedat(h,data,h->datoff,SEEK_END);
                 _db_writeidx(h,key,h->idxoff,SEEK_END,ptrval); //头插法，将新的索引记录插入到链表的头部，原本的第一条记录的偏移量作为新记录的next指针
                 _db_writeptr(h,h->chainoff,h->idxoff);       //头插法,将哈希桶的头指针指向新插入的索引记录
-
                 h->cnt_stor1++;
+                return 1;
             }else{
                 //可以重用，此时直接将内容写入findfree中找到的idxoff和datoff
                 _db_writedat(h, data, h->datoff, SEEK_SET);
                 _db_writeidx(h, key, h->idxoff, SEEK_SET, ptrval);
                 _db_writeptr(h, h->chainoff, h->idxoff);
                 h->cnt_stor2++;
+                return 1;
             }
         }
     }else{
@@ -601,6 +630,7 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
                 //如果长度一致，那么直接覆盖
                 _db_writedat(h,data,h->datoff,SEEK_SET);
                 h->cnt_stor3++;
+                return 1;
             }else{
                 //如果长度不一致，那么需要将数据追加到数据文件的尾部
                 _db_dodelete(h);	
@@ -609,6 +639,8 @@ int db_store(DBHANDLE db, const char *key, const char *data, int flag){
                 _db_writeidx(h, key, 0, SEEK_END, ptrval);
                 _db_writeptr(h, h->chainoff, h->idxoff);
                 h->cnt_stor4++;
+                return 1;
             }
         }
+    }
 }

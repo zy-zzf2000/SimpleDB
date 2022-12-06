@@ -7,6 +7,9 @@ project(DBT VERSION 1.0)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+SET(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_C_FLAGS_DEBUG "$ENV{CXXFLAGS} -O0 -Wall -g")
+
 add_subdirectory(db)
 link_directories(db)
 

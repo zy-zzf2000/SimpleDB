@@ -2,7 +2,7 @@
  * @Author: zy 953725892@qq.com
  * @Date: 2022-12-05 11:30:11
  * @LastEditors: zy 953725892@qq.com
- * @LastEditTime: 2022-12-05 11:36:38
+ * @LastEditTime: 2022-12-06 14:42:37
  * @FilePath: /db/main.c
  * @Description: 
  * 
@@ -19,5 +19,8 @@
 int main(){
     DBHANDLE db;
     db = db_open("db", O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    db_store(db,"test","test",DB_INSERT);
+    char* value = db_fetch(db,"test");
+    printf("%s",value);
     return 0;
 }
